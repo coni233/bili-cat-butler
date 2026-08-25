@@ -1,0 +1,10 @@
+/* 模拟 t.bilibili.com 动态页的裸标签全局规则（从真实 CSS 中提取的关键干扰项） */
+main { width: 556px; margin-right: 12px; position: relative; }
+@media screen and (min-width:1140px){ main { width: 556px; } }
+@media screen and (min-width:1320px){ main { width: 724px; } }
+section { width: 100%; margin-bottom: 8px; }
+span { color: #888; margin-left: 4px; font-size: 15px; font-weight: 400; }
+span { width: 40px; margin-left: 1px; font-weight: 500; display: block; transform: scale(.75); }
+span { line-height: 12px; display: block; }
+span { margin-left: 2px; padding: 0 1px; font-size: 12px; display: block; }
+button { background-color: #00aeec; color: #fff; border: none; border-radius: 6px; width: 72px; height: 30px; font-size: 13px; line-height: 1; display: flex; }

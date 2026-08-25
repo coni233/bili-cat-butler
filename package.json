@@ -1,0 +1,17 @@
+{
+  "name": "bili-cat-butler",
+  "version": "1.0.0",
+  "description": "开源的 B 站直播养猫自动化用户脚本",
+  "private": true,
+  "scripts": {
+    "test": "node tests/smoke.test.js && node tests/engine.test.js && node tests/ui.test.js && node tests/layout.test.js",
+    "check": "node --check bili-cat-butler.user.js",
+    "test:unit": "node tests/smoke.test.js && node tests/engine.test.js",
+    "test:ui": "node tests/ui.test.js",
+    "test:layout": "node tests/layout.test.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
