@@ -4,7 +4,7 @@
 // @homepageURL  https://github.com/coni233/bili-cat-butler
 // @supportURL   https://github.com/coni233/bili-cat-butler/issues
 // @license      MIT
-// @version      1.0.0
+// @version      1.0.1
 // @description  开源的 B 站直播养猫自动化工具：签到 / 喂食 / 摸自己 / 摸同担（全部/前N/指定UID）/ 投喂手幅。全新界面与任务引擎，零自动关注、纯本地存储、可审计。
 // @author       coni
 // @match        https://live.bilibili.com/*
@@ -35,6 +35,9 @@
 
 (function () {
   'use strict';
+
+  /* 脚本版本：优先读取管理器提供的版本号，测试环境回退到内置值 */
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.0.1';
 
   /* ===================== 事实常量（B 站活动接口参数） ===================== */
   const ACTIVITY = Object.freeze({
@@ -94,6 +97,15 @@
     blacklist: '',
     notify: true,
   });
+
+  /* 摸猫容错：单次 0 成长/瞬时返回后的短冷却（毫秒，控制在 10 秒内） */
+  const PET_ZERO_COOLDOWN = [5000, 8000];
+  /* 连续无成长达到该次数即停止本轮（不标记完成，留给后续运行重试） */
+  const PET_ZERO_LIMIT = 5;
+  /* 单次运行最多轮数（首轮 + 最多 1 轮快速补做） */
+  const MAX_TASK_PASSES = 2;
+  /* 补做轮之间的冷却范围（毫秒，控制在 10 秒内） */
+  const REDO_WAIT_RANGE = [8000, 10000];
 
   /* ===================== 基础工具 ===================== */
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -667,7 +679,8 @@
     if (/(猫粮|猫食|食物|口粮)/.test(msg) && /(不足|没有|不够|耗尽|用完|为零|=0)/.test(msg)) {
       return { kind: 'exhausted', msg };
     }
-    if (/(上限|已满|次数已满|已达上限|今日已满|不能再)/.test(msg)) return { kind: 'capped', msg };
+    if (/(上限|已满|次数已满|已达上限|今日已满|不能再|次数用完|已用完)/.test(msg)) return { kind: 'capped', msg };
+    if (/(频繁|太快|稍后|冷却|休息|繁忙|限流|风控|操作过快)/.test(msg)) return { kind: 'transient', msg };
     if (code === 0) return { kind: 'ok', msg };
     if (/(次数|上限|已满|达到|冷却|今日|今天|不能|无法)/.test(msg)) return { kind: 'capped', msg };
     return { kind: 'fail', msg: msg || '未知返回' };
@@ -726,11 +739,10 @@
         }
         this.ui.log('ok', `已登录：${info.name}${info.offline ? '（本地 Cookie 判定）' : ''}`);
 
-        do {
-          const hadWork = await this._pass(testMode);
-          if (testMode) break;
-          if (this._stopping || this._fatal) break;
-          if (!hadWork) {
+        for (;;) {
+          const roundResult = await this._round(testMode);
+          if (testMode || this._stopping || this._fatal) break;
+          if (!roundResult.processed) {
             this.ui.log('ok', '所有已选房间今日任务均已完工，巡航自动结束（明天再运行即可）。');
             break;
           }
@@ -738,8 +750,10 @@
             const mins = clamp(Number(this.store.settings.cruiseMinutes) || 240, 5, 720);
             this.ui.log('info', `巡航模式：${mins} 分钟后开始下一轮（今日已完成项目会自动跳过）`);
             await this._wait(mins * 60 * 1000);
+          } else {
+            break;
           }
-        } while (this.store.settings.mode === 'cruise' && !this._stopping && !this._fatal);
+        }
 
         if (this._fatal) {
           this.ui.log('err', `⛔ 登录态失效：${this._fatal.message}，任务已停止。`);
@@ -747,8 +761,14 @@
         } else if (this._stopping) {
           this.ui.log('warn', '已停止，进度已保存在本地。');
         } else {
-          this.ui.log('ok', '🎉 本轮任务全部结束。');
-          if (this.store.settings.notify) gmNotify('猫咪养成助手', '本轮养猫任务完成喵～');
+          const unfinished = this.store.selectedRooms().filter((r) => !this.store.roomDone(r.ruid));
+          if (unfinished.length) {
+            this.ui.log('warn', `仍有 ${unfinished.length} 个房间有未完成项（多为摸猫被限流或临时失败），巡航/下次运行会自动重试。`);
+            if (this.store.settings.notify) gmNotify('猫咪养成助手', `${unfinished.length} 个房间未完成，稍后会自动重试。`);
+          } else {
+            this.ui.log('ok', '🎉 本轮任务全部结束。');
+            if (this.store.settings.notify) gmNotify('猫咪养成助手', '本轮养猫任务完成喵～');
+          }
         }
       } catch (e) {
         this.ui.log('err', `任务异常终止：${e.message}`);
@@ -760,28 +780,49 @@
       }
     }
 
-    async _pass(testMode) {
-      const rooms = this.store.pendingRooms(testMode);
+    /* 一轮任务：首轮 + 最多 2 次「摸自己」补做（补做轮只摸猫，不重跑手幅等） */
+    async _round(testMode) {
+      let redoRooms = [];
+      let passCount = 0;
+      for (;;) {
+        const passResult = await this._pass(testMode, redoRooms);
+        if (testMode || this._stopping || this._fatal) return { processed: false, petPendingRooms: [] };
+        if (!passResult.processed) return passResult;
+        passCount++;
+        redoRooms = passResult.petPendingRooms || [];
+        if (redoRooms.length && passCount < MAX_TASK_PASSES) {
+          this.ui.log('warn', `有 ${redoRooms.length} 个房间「摸自己」未完成，等待 ${(REDO_WAIT_RANGE[0] / 1000).toFixed(0)}~${(REDO_WAIT_RANGE[1] / 1000).toFixed(0)} 秒后补做（第 ${passCount + 1} 轮）…`);
+          await this._wait(rand(REDO_WAIT_RANGE[0], REDO_WAIT_RANGE[1]));
+          continue;
+        }
+        return passResult;
+      }
+    }
+
+    async _pass(testMode, onlyRooms) {
+      const rooms = onlyRooms && onlyRooms.length ? onlyRooms : this.store.pendingRooms(testMode);
       if (!rooms.length) {
         this.ui.log('info', testMode
           ? '没有可选中的房间，请先在「猫咪」页选择。'
           : '所有已选房间今日任务均已完成 ✓');
-        return false;
+        return { processed: false, petPendingRooms: [] };
       }
       this.ui.log('info', `本轮待处理 ${rooms.length} 个房间。`);
       rooms.forEach((r) => this._roomStates.set(r.ruid, 'idle'));
       this.ui.sync();
 
+      const petPendingRooms = [];
       for (let i = 0; i < rooms.length; i++) {
         if (this._stopping || this._fatal) break;
         const room = rooms[i];
         this.ui.log('info', `▶ [${i + 1}/${rooms.length}] ${room.name} (${room.ruid})`);
-        await this._runRoom(room, testMode);
+        const result = await this._runRoom(room, testMode, !!(onlyRooms && onlyRooms.length));
+        if (result && result.petSelfPending) petPendingRooms.push(room);
         if (!this._stopping && !this._fatal) await this._wait(rand(2500, 5000));
       }
       const done = rooms.filter((r) => this.store.roomDone(r.ruid)).length;
       this.ui.log('ok', `本轮完成：${done}/${rooms.length}`);
-      return rooms.length > 0;
+      return { processed: rooms.length > 0, petPendingRooms };
     }
 
     async _retry(label, fn) {
@@ -824,7 +865,7 @@
       }
     }
 
-    async _runRoom(room, force) {
+    async _runRoom(room, force, petSelfOnly) {
       const { store, api } = this;
       const settings = store.settings;
       const ruid = String(room.ruid);
@@ -834,20 +875,22 @@
       this._roomStates.set(ruid, 'running');
       this.ui.sync();
 
-      /* 0) 领养：尽力而为，不参与今日进度 */
-      const adoptOut = await this._attempt('领养', () => api.adopt(ruid, csrf));
-      if (adoptOut) {
-        if (adoptOut.v.kind === 'fatal') {
-          this._fatal = new Error(adoptOut.v.msg || '登录态失效');
-          this.ui.sync();
-          return;
+      /* 0) 领养：尽力而为，不参与今日进度（补做轮跳过） */
+      if (!petSelfOnly) {
+        const adoptOut = await this._attempt('领养', () => api.adopt(ruid, csrf));
+        if (adoptOut) {
+          if (adoptOut.v.kind === 'fatal') {
+            this._fatal = new Error(adoptOut.v.msg || '登录态失效');
+            this.ui.sync();
+            return;
+          }
+          this.ui.log(adoptOut.v.kind === 'ok' ? 'ok' : 'info', `[领养] ${room.name}：${adoptOut.v.msg || '完成'}`);
         }
-        this.ui.log(adoptOut.v.kind === 'ok' ? 'ok' : 'info', `[领养] ${room.name}：${adoptOut.v.msg || '完成'}`);
+        await this._wait(rand(800, 1800));
       }
-      await this._wait(rand(800, 1800));
 
       /* 1) 签到 */
-      if (g.sign && (force || !store.stageDone(ruid, 'sign'))) {
+      if (!petSelfOnly && g.sign && (force || !store.stageDone(ruid, 'sign'))) {
         const out = await this._attempt('签到', () => api.sign(ruid, csrf));
         if (out) {
           if (out.v.kind === 'fatal') {
@@ -867,7 +910,7 @@
       }
 
       /* 2) 喂食：直到猫粮耗尽或达到安全上限 */
-      if (g.feed && (force || !store.stageDone(ruid, 'feed'))) {
+      if (!petSelfOnly && g.feed && (force || !store.stageDone(ruid, 'feed'))) {
         this.ui.log('info', `[喂食] ${room.name}：开始消耗猫粮…`);
         let rounds = 0;
         let reason = 'limit';
@@ -918,10 +961,12 @@
       }
 
       /* 3) 摸自己的猫：攒满 50 成长 */
+      let petSelfIncomplete = false;
       if (g.petSelf && (force || !store.stageDone(ruid, 'petSelf'))) {
         this.ui.log('info', `[摸自己] ${room.name}：开始…`);
         let gained = 0;
         let rounds = 0;
+        let zeroStreak = 0;
         let reason = 'limit';
         while (rounds < settings.selfPetLimit && !this._stopping && !this._fatal) {
           rounds++;
@@ -934,14 +979,28 @@
             this._fatal = new Error(out.v.msg || '登录态失效');
             break;
           }
+          if (out.v.kind === 'capped') {
+            this.ui.log('info', `[摸自己] ${room.name}：${out.v.msg || '今日已满'}，停止。`);
+            reason = 'cap';
+            break;
+          }
           if (out.v.kind === 'ok') {
             const d = out.res.data || {};
             const delta = Number(d.growth_delta) || 0;
             if (delta <= 0) {
-              this.ui.log('info', `[摸自己] ${room.name}：今日成长已满或无法再获得，停止。`);
-              reason = 'cap';
+              zeroStreak++;
+              if (zeroStreak <= PET_ZERO_LIMIT) {
+                const raw = JSON.stringify(d && Object.keys(d).length ? d : out.res).slice(0, 120);
+                this.ui.log('warn', `[摸自己] ${room.name}：接口未返回成长（原始：${raw}），${(PET_ZERO_COOLDOWN[0] / 1000).toFixed(0)}~${(PET_ZERO_COOLDOWN[1] / 1000).toFixed(0)} 秒后继续（${zeroStreak}/${PET_ZERO_LIMIT}），可能是频率限制…`);
+                await this._wait(rand(PET_ZERO_COOLDOWN[0], PET_ZERO_COOLDOWN[1]));
+                rounds--;
+                continue;
+              }
+              this.ui.log('info', `[摸自己] ${room.name}：连续 ${PET_ZERO_LIMIT} 次未返回成长，按“今日已满或暂不可摸”停止（本轮不标记完成）。`);
+              reason = 'retry';
               break;
             }
+            zeroStreak = 0;
             gained += delta;
             store.bumpStats({ pets: (store.stats.pets || 0) + 1, growth: (store.stats.growth || 0) + delta });
             this.ui.log('ok', `[摸自己] 第 ${rounds} 次：成长 +${delta}（本轮 ${gained}/50）`);
@@ -950,24 +1009,35 @@
               reason = 'cap';
               break;
             }
-          } else if (out.v.kind === 'capped') {
-            reason = 'cap';
+          } else if (out.v.kind === 'transient') {
+            zeroStreak++;
+            if (zeroStreak <= PET_ZERO_LIMIT) {
+              this.ui.log('warn', `[摸自己] ${room.name}：${out.v.msg || '接口繁忙'}，${(PET_ZERO_COOLDOWN[0] / 1000).toFixed(0)}~${(PET_ZERO_COOLDOWN[1] / 1000).toFixed(0)} 秒后继续（${zeroStreak}/${PET_ZERO_LIMIT}）…`);
+              await this._wait(rand(PET_ZERO_COOLDOWN[0], PET_ZERO_COOLDOWN[1]));
+              rounds--;
+              continue;
+            }
+            this.ui.log('info', `[摸自己] ${room.name}：接口持续繁忙，本轮跳过（不标记完成）。`);
+            reason = 'retry';
             break;
           } else {
             this.ui.log('warn', `[摸自己] ${room.name}：${out.v.msg}，停止本轮。`);
             reason = 'fail';
             break;
           }
-          await this._wait(rand(1500, 2800));
+          await this._wait(rand(2000, 3500));
         }
-        if (reason !== 'fail' && !this._stopping && !this._paused && !this._fatal) {
+        if (reason === 'cap' && !this._stopping && !this._paused && !this._fatal) {
           store.markStage(ruid, 'petSelf');
+        }
+        if ((reason === 'cap' || reason === 'limit') && !this._stopping && !this._paused && !this._fatal) {
           this.ui.log('info', `[摸自己] ${room.name}：本轮共获得 ${gained} 成长。`);
         }
+        if (reason !== 'cap') petSelfIncomplete = true;
       }
 
       /* 4) 摸同担（排行榜 / 指定 UID） */
-      if (g.petRank && (force || !store.stageDone(ruid, 'petRank'))) {
+      if (!petSelfOnly && g.petRank && (force || !store.stageDone(ruid, 'petRank'))) {
         let ok = true;
         try {
           let cats = [];
@@ -1001,6 +1071,7 @@
           for (let i = 0; i < others.length; i++) {
             if (this._stopping || this._fatal) break;
             const cat = others[i];
+            let zeroStreak = 0;
             for (let p = 0; p < g.pokeTimes; p++) {
               if (this._stopping || this._fatal) break;
               const out = await this._attempt('摸猫', () => api.pet(ruid, cat.uid, csrf));
@@ -1009,15 +1080,23 @@
                 this._fatal = new Error(out.v.msg || '登录态失效');
                 break;
               }
-              if (out.v.kind === 'ok') {
-                const d = out.res && out.res.data;
-                const delta = Number(d && d.growth_delta) || 0;
-                const realCat = !!(d && (delta > 0 || d.cat_level != null || d.growth != null));
-                if (!realCat) {
-                  petSkipCats.add(cat.uid);
-                  this.ui.log('warn', `[摸同担] ${cat.name}（${cat.uid}）：接口 code=0 但未返回有效成长数据（${JSON.stringify(d || {}).slice(0, 100)}），未计入成功，跳过。`);
-                  break;
+              const d = out.res && out.res.data;
+              const delta = Number(d && d.growth_delta) || 0;
+              const realCat = !!(d && (delta > 0 || d.cat_level != null || d.growth != null));
+              if (out.v.kind === 'transient' || (out.v.kind === 'ok' && !realCat)) {
+                zeroStreak++;
+                if (zeroStreak <= 3) {
+                  const raw = JSON.stringify(d && Object.keys(d).length ? d : out.res).slice(0, 100);
+                  this.ui.log('warn', `[摸同担] ${cat.name}（${cat.uid}）：接口未返回有效成长（原始：${raw}），${(PET_ZERO_COOLDOWN[0] / 1000).toFixed(0)}~${(PET_ZERO_COOLDOWN[1] / 1000).toFixed(0)} 秒后重试（${zeroStreak}/3），可能是频率限制…`);
+                  await this._wait(rand(PET_ZERO_COOLDOWN[0], PET_ZERO_COOLDOWN[1]));
+                  p--;
+                  continue;
                 }
+                petSkipCats.add(cat.uid);
+                this.ui.log('warn', `[摸同担] ${cat.name}（${cat.uid}）：连续 3 次未返回有效成长，跳过。`);
+                break;
+              }
+              if (out.v.kind === 'ok') {
                 store.bumpStats({ pets: (store.stats.pets || 0) + 1 });
                 petOkCats.add(cat.uid);
                 petOkTimes++;
@@ -1031,9 +1110,9 @@
                 this.ui.log('warn', `[摸同担] ${cat.name}（${cat.uid}）：接口 code=${out.res && out.res.code}，${out.v.msg || '不在本房间或无法抚摸'}，跳过。`);
                 break;
               }
-              await this._wait(rand(600, 1400));
+              await this._wait(rand(1200, 2200));
             }
-            await this._wait(rand(800, 1800));
+            await this._wait(rand(1500, 2500));
           }
           this.ui.log('info', `[摸同担] ${room.name}：${scopeDesc}，成功 ${petOkCats.size} 只，跳过 ${petSkipCats.size} 只（共抚摸 ${petOkTimes} 次）。`);
           if (petOkCats.size === 0 && others.length > 0) {
@@ -1047,7 +1126,7 @@
       }
 
       /* 5) 投喂粉丝手幅（消耗 1 电池，默认关闭） */
-      if (g.banner && (force || !store.stageDone(ruid, 'banner'))) {
+      if (!petSelfOnly && g.banner && (force || !store.stageDone(ruid, 'banner'))) {
         try {
           const roomId = await this._retry('直播间查询', () => this.api.masterRoomId(ruid));
           const out = await this._attempt('手幅', () => this.api.sendBanner({
@@ -1076,6 +1155,7 @@
       this._roomStates.set(ruid, done ? 'done' : 'failed');
       this.ui.log(done ? 'ok' : 'warn', `[房间] ${room.name}：${done ? '今日任务全部完成 ✓' : '部分阶段未完成，保留待重试'}`);
       this.ui.sync();
+      return { petSelfPending: !!(g.petSelf && petSelfIncomplete && !store.stageDone(ruid, 'petSelf') && !this._fatal && !this._stopping) };
     }
 
     async _fetchRankCats(ruid, limit) {
@@ -2439,7 +2519,7 @@
       return;
     }
     window.__MIAO_BUTLER_ACTIVE__ = true;
-    console.log('[猫咪养成助手] v1.0.0 初始化开始');
+    console.log(`[猫咪养成助手] v${SCRIPT_VERSION} 初始化开始`);
     try {
       const store = new Store();
       const session = new Session();
@@ -2449,7 +2529,7 @@
       const engine = new TaskEngine({ store, api, session, ui });
       ui.engine = engine;
       ui.build();
-      ui.log('info', '猫咪养成助手 v1.0.0 已加载。');
+      ui.log('info', `猫咪养成助手 v${SCRIPT_VERSION} 已加载。`);
       session.refresh().then(() => {
         ui.renderLogin();
         if (session.info) {

@@ -106,10 +106,11 @@ assert.strictEqual(verdict({ code: -400 }).kind, 'fatal');
 assert.strictEqual(verdict({ code: 1, message: '今日已签到' }).kind, 'already');
 assert.strictEqual(verdict({ code: 1, message: '猫粮不足' }).kind, 'exhausted');
 assert.strictEqual(verdict({ code: 1, message: '今日摸猫次数已满' }).kind, 'capped');
-assert.strictEqual(verdict({ code: 1, message: '系统繁忙' }).kind, 'fail');
+assert.strictEqual(verdict({ code: 1, message: '系统繁忙' }).kind, 'transient');
 assert.strictEqual(verdict({ code: 0, message: '今日摸猫次数已满' }).kind, 'capped');
 assert.strictEqual(verdict({ code: 0, message: '今日已签到' }).kind, 'already');
 assert.strictEqual(verdict({ code: 0, message: '猫粮不足' }).kind, 'exhausted');
+assert.strictEqual(verdict({ code: 0, message: '操作频繁，请稍后再试' }).kind, 'transient');
 assert.strictEqual(verdict({ code: 1 }).kind, 'fail');
 
 /* ---------- 文本解析 ---------- */

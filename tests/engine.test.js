@@ -2,7 +2,7 @@
 
 /* 引擎运行时测试：
  * - 从用户脚本提取 TaskEngine 及依赖，替换延迟为 0 后真实执行 _runRoom。
- * - 覆盖：基础领养、摸自己已满即停、完整流水线、指定 UID 预核对、排行榜前 N、
+ * - 覆盖：基础领养、摸自己 0 成长重试/已满判定、完整流水线、指定 UID 预核对、排行榜前 N、
  *   登录失效终止、喂食零成长停止、手幅失败不标记完成。
  */
 const assert = require('assert');
@@ -61,6 +61,10 @@ let engineCode = [
   extractBlock('function rand\\(', 'rand'),
   extractBlock('function clamp\\(', 'clamp'),
   extractBlock('function verdict\\(', 'verdict'),
+  extractStatement('const PET_ZERO_COOLDOWN =', 'PET_ZERO_COOLDOWN'),
+  extractStatement('const PET_ZERO_LIMIT =', 'PET_ZERO_LIMIT'),
+  extractStatement('const MAX_TASK_PASSES =', 'MAX_TASK_PASSES'),
+  extractStatement('const REDO_WAIT_RANGE =', 'REDO_WAIT_RANGE'),
   extractBlock('class TaskEngine ', 'TaskEngine'),
 ].join('\n\n');
 
@@ -91,6 +95,8 @@ function makeStore(overrides) {
     markStage: (ruid, stage) => { marks.add(stage); },
     roomDone: () => false,
     enabledStages: () => [],
+    selectedRooms: () => [],
+    pendingRooms: () => [],
     bumpStats: (patch) => { store.stats = Object.assign(store.stats || { growth: 0, food: 0, pets: 0, gifts: 0 }, patch); },
     stats: { growth: 0, food: 0, pets: 0, gifts: 0 },
   };
@@ -123,7 +129,7 @@ async function run(store, api) {
     assert.ok(!engine._fatal, '不应有致命错误');
   }
 
-  /* 场景2：摸自己已满（growth_delta=0）→ 只摸 1 次即停 */
+  /* 场景2：摸自己返回 0 成长且无“已满”消息 → 重试 3 次后停止，不标记完成 */
   {
     let petCalls = 0;
     const store = makeStore({ group: { petSelf: true, selfPetLimit: 15 } });
@@ -132,9 +138,41 @@ async function run(store, api) {
       pet: async () => { petCalls++; return { code: 0, data: { growth_delta: 0 } }; },
     };
     const { ui } = await run(store, api);
-    assert.strictEqual(petCalls, 1, '成长为 0 时应只摸一次');
-    assert.ok(ui.logs.some((l) => l.includes('今日成长已满')), '应输出已满日志');
-    assert.ok(store.marks.has('petSelf'), '应标记摸自己完成');
+    assert.strictEqual(petCalls, 6, '0 成长无明确消息时应先退避重试 5 次（共 6 次请求）');
+    assert.ok(ui.logs.some((l) => l.includes('连续 5 次未返回成长')), '应输出重试后停止的日志');
+    assert.ok(!store.marks.has('petSelf'), '未确认已满时不应标记摸自己完成');
+  }
+
+  /* 场景2b：摸自己返回明确“已满”消息 → 1 次即停并标记完成 */
+  {
+    let petCalls = 0;
+    const store = makeStore({ group: { petSelf: true, selfPetLimit: 15 } });
+    const api = {
+      adopt: async () => ({ code: 0 }),
+      pet: async () => { petCalls++; return { code: 0, message: '今日摸猫次数已达上限', data: { growth_delta: 0 } }; },
+    };
+    const { ui } = await run(store, api);
+    assert.strictEqual(petCalls, 1, '明确已满时应只摸一次');
+    assert.ok(ui.logs.some((l) => l.includes('今日摸猫次数已达上限')), '应输出已满原因');
+    assert.ok(store.marks.has('petSelf'), '明确已满应标记完成');
+  }
+
+  /* 场景2c：摸自己先返回 0 成长后恢复 → 应继续摸并攒满 50 */
+  {
+    let petCalls = 0;
+    const store = makeStore({ group: { petSelf: true, selfPetLimit: 15 } });
+    const api = {
+      adopt: async () => ({ code: 0 }),
+      pet: async () => {
+        petCalls++;
+        if (petCalls <= 2) return { code: 0, data: { growth_delta: 0 } };
+        return { code: 0, data: { growth_delta: 10 } };
+      },
+    };
+    await run(store, api);
+    assert.strictEqual(petCalls, 7, '2 次 0 成长后应恢复（重试 2 次 + 成功 5 次 = 7 次请求）');
+    assert.ok(store.marks.has('petSelf'), '攒满 50 后应标记完成');
+    assert.strictEqual(store.stats.growth, 50, '累计成长应为 50');
   }
 
   /* 场景3：完整流水线（签到/喂食/摸自己/摸同担全部/手幅） */
@@ -255,7 +293,69 @@ async function run(store, api) {
     assert.ok(ui.logs.some((l) => l.includes('电池不足')), '应提示失败原因');
   }
 
-  console.log('✅ 引擎测试全部通过（8 个场景）');
+  /* 场景9：摸自己首轮被限流 → 自动补做一轮（只补摸自己），直到攒满 50 */
+  {
+    let petCalls = 0;
+    let adoptCalls = 0;
+    const store = makeStore({
+      group: { petSelf: true, selfPetLimit: 15 },
+      store: {
+        roomDone: () => store.marks.has('petSelf'),
+        selectedRooms: () => [],
+        pendingRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
+      },
+    });
+    const api = {
+      adopt: async () => { adoptCalls++; return { code: 0 }; },
+      pet: async () => {
+        petCalls++;
+        if (petCalls <= 6) return { code: 0, data: { growth_delta: 0 } };
+        return { code: 0, data: { growth_delta: 10 } };
+      },
+    };
+    const ui = makeUi();
+    const engine = new TaskEngine({
+      store,
+      api,
+      session: { uid: '10086', csrf: 'csrf', refresh: async () => ({ uid: '10086', name: '测试用户' }) },
+      ui,
+    });
+    await engine.start({ testMode: false });
+    assert.strictEqual(petCalls, 11, '首轮 6 次退避失败后，补做轮 5 次成功');
+    assert.strictEqual(adoptCalls, 1, '补做轮只补摸自己，不应重复领养/签到等');
+    assert.ok(store.marks.has('petSelf'), '补做成功后应标记完成');
+    assert.ok(ui.logs.some((l) => l.includes('补做')), '应有补做日志');
+  }
+
+  /* 场景10：始终 0 成长 → 首轮 + 1 次快速补做后不再重试，保持未完成 */
+  {
+    let petCalls = 0;
+    const store = makeStore({
+      group: { petSelf: true, selfPetLimit: 15 },
+      store: {
+        roomDone: () => store.marks.has('petSelf'),
+        selectedRooms: () => [],
+        pendingRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
+      },
+    });
+    const api = {
+      adopt: async () => ({ code: 0 }),
+      pet: async () => { petCalls++; return { code: 0, data: { growth_delta: 0 } }; },
+    };
+    const ui = makeUi();
+    const engine = new TaskEngine({
+      store,
+      api,
+      session: { uid: '10086', csrf: 'csrf', refresh: async () => ({ uid: '10086', name: '测试用户' }) },
+      ui,
+    });
+    await engine.start({ testMode: false });
+    assert.strictEqual(petCalls, 12, '首轮 6 次 + 补做轮 6 次，最多两轮即停');
+    assert.ok(!store.marks.has('petSelf'), '始终 0 成长不应标记完成');
+    assert.strictEqual(ui.logs.filter((l) => l.includes('补做')).length, 1, '最多只补做一次');
+  }
+
+  console.log('✅ 引擎测试全部通过（12 个场景）');
 })().catch((e) => {
   console.error('引擎测试失败：', e);
   process.exit(1);
