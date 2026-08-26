@@ -4,7 +4,7 @@
 // @homepageURL  https://github.com/coni233/bili-cat-butler
 // @supportURL   https://github.com/coni233/bili-cat-butler/issues
 // @license      MIT
-// @version      1.0.1
+// @version      1.0.2
 // @description  开源的 B 站直播养猫自动化工具：签到 / 喂食 / 摸自己 / 摸同担（全部/前N/指定UID）/ 投喂手幅。全新界面与任务引擎，零自动关注、纯本地存储、可审计。
 // @author       coni
 // @match        https://live.bilibili.com/*
@@ -37,7 +37,7 @@
   'use strict';
 
   /* 脚本版本：优先读取管理器提供的版本号，测试环境回退到内置值 */
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.0.1';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.0.2';
 
   /* ===================== 事实常量（B 站活动接口参数） ===================== */
   const ACTIVITY = Object.freeze({
@@ -865,6 +865,60 @@
       }
     }
 
+    /* 喂食循环：消耗猫粮直到耗尽或达到安全上限；失败时不标记完成，留给下次重试 */
+    async _feedRoom(room, ruid, myUid, csrf, tag) {
+      const label = tag || '喂食';
+      const settings = this.store.settings;
+      this.ui.log('info', `[${label}] ${room.name}：开始消耗猫粮…`);
+      let rounds = 0;
+      let reason = 'limit';
+      while (rounds < settings.feedLimit && !this._stopping && !this._fatal) {
+        rounds++;
+        const out = await this._attempt(label, () => this.api.feed(ruid, myUid, csrf));
+        if (!out) {
+          reason = 'fail';
+          break;
+        }
+        if (out.v.kind === 'fatal') {
+          this._fatal = new Error(out.v.msg || '登录态失效');
+          break;
+        }
+        if (out.v.kind === 'ok') {
+          const d = out.res.data || {};
+          const delta = Number(d.growth_delta) || 0;
+          this.store.bumpStats({ food: (this.store.stats.food || 0) + 1, growth: (this.store.stats.growth || 0) + delta });
+          this.ui.log('ok', `[${label}] 第 ${rounds} 次：成长 +${delta}，Lv.${d.cat_level != null ? d.cat_level : '?'}，余粮 ${d.food_balance != null ? d.food_balance : '?'}`);
+          (d.level_up_list || []).forEach((l) => this.ui.log('star', `🎉 ${l.title || '恭喜升级！'}`));
+          if (Number(d.food_balance) <= 0) {
+            reason = 'empty';
+            break;
+          }
+          if (delta <= 0 && d.food_balance == null) {
+            reason = 'empty';
+            break;
+          }
+        } else if (out.v.kind === 'exhausted') {
+          this.ui.log('warn', `[${label}] ${room.name}：${out.v.msg || '猫粮不足'}，停止。`);
+          reason = 'empty';
+          break;
+        } else if (out.v.kind === 'capped') {
+          this.ui.log('warn', `[${label}] ${room.name}：${out.v.msg || '今日已达上限'}，停止。`);
+          reason = 'capped';
+          break;
+        } else {
+          this.ui.log('warn', `[${label}] ${room.name}：${out.v.msg}，停止本轮。`);
+          reason = 'fail';
+          break;
+        }
+        await this._wait(rand(1200, 2400));
+      }
+      if (reason !== 'fail' && !this._stopping && !this._paused && !this._fatal) {
+        this.store.markStage(ruid, 'feed');
+        this.ui.log('info', `[${label}] ${room.name}：本轮结束（${reason === 'empty' ? '猫粮已耗尽' : '达到上限或安全阈值'}）。`);
+      }
+      return reason;
+    }
+
     async _runRoom(room, force, petSelfOnly) {
       const { store, api } = this;
       const settings = store.settings;
@@ -911,53 +965,7 @@
 
       /* 2) 喂食：直到猫粮耗尽或达到安全上限 */
       if (!petSelfOnly && g.feed && (force || !store.stageDone(ruid, 'feed'))) {
-        this.ui.log('info', `[喂食] ${room.name}：开始消耗猫粮…`);
-        let rounds = 0;
-        let reason = 'limit';
-        while (rounds < settings.feedLimit && !this._stopping && !this._fatal) {
-          rounds++;
-          const out = await this._attempt('喂食', () => api.feed(ruid, myUid, csrf));
-          if (!out) {
-            reason = 'fail';
-            break;
-          }
-          if (out.v.kind === 'fatal') {
-            this._fatal = new Error(out.v.msg || '登录态失效');
-            break;
-          }
-          if (out.v.kind === 'ok') {
-            const d = out.res.data || {};
-            const delta = Number(d.growth_delta) || 0;
-            store.bumpStats({ food: (store.stats.food || 0) + 1, growth: (store.stats.growth || 0) + delta });
-            this.ui.log('ok', `[喂食] 第 ${rounds} 次：成长 +${delta}，Lv.${d.cat_level != null ? d.cat_level : '?'}，余粮 ${d.food_balance != null ? d.food_balance : '?'}`);
-            (d.level_up_list || []).forEach((l) => this.ui.log('star', `🎉 ${l.title || '恭喜升级！'}`));
-            if (Number(d.food_balance) <= 0) {
-              reason = 'empty';
-              break;
-            }
-            if (delta <= 0 && d.food_balance == null) {
-              reason = 'empty';
-              break;
-            }
-          } else if (out.v.kind === 'exhausted') {
-            this.ui.log('warn', `[喂食] ${room.name}：${out.v.msg || '猫粮不足'}，停止。`);
-            reason = 'empty';
-            break;
-          } else if (out.v.kind === 'capped') {
-            this.ui.log('warn', `[喂食] ${room.name}：${out.v.msg || '今日已达上限'}，停止。`);
-            reason = 'capped';
-            break;
-          } else {
-            this.ui.log('warn', `[喂食] ${room.name}：${out.v.msg}，停止本轮。`);
-            reason = 'fail';
-            break;
-          }
-          await this._wait(rand(1200, 2400));
-        }
-        if (reason !== 'fail' && !this._stopping && !this._paused && !this._fatal) {
-          store.markStage(ruid, 'feed');
-          this.ui.log('info', `[喂食] ${room.name}：本轮结束（${reason === 'empty' ? '猫粮已耗尽' : '达到上限或安全阈值'}）。`);
-        }
+        await this._feedRoom(room, ruid, myUid, csrf, '喂食');
       }
 
       /* 3) 摸自己的猫：攒满 50 成长 */
@@ -1125,7 +1133,7 @@
         if (ok && !this._stopping && !this._paused && !this._fatal) store.markStage(ruid, 'petRank');
       }
 
-      /* 5) 投喂粉丝手幅（消耗 1 电池，默认关闭） */
+      /* 5) 投喂粉丝手幅（消耗 1 电池，默认关闭；成功后自动喂食消耗回馈的猫粮） */
       if (!petSelfOnly && g.banner && (force || !store.stageDone(ruid, 'banner'))) {
         try {
           const roomId = await this._retry('直播间查询', () => this.api.masterRoomId(ruid));
@@ -1142,6 +1150,10 @@
               store.bumpStats({ gifts: (store.stats.gifts || 0) + 1 });
               store.markStage(ruid, 'banner');
               this.ui.log('ok', `[手幅] ${room.name}：已投喂（消耗 1 电池）`);
+              if (g.feed) {
+                this.ui.log('info', `[手幅] ${room.name}：回馈猫粮 1 个，自动喂食…`);
+                await this._feedRoom(room, ruid, myUid, csrf, '喂食·手幅');
+              }
             } else {
               this.ui.log('warn', `[手幅] ${room.name}：${out.v.msg || '投喂失败'}。若电池已扣但标记失败，请勿重复勾选重跑。`);
             }

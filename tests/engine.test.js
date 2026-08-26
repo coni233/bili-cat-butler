@@ -3,7 +3,7 @@
 /* 引擎运行时测试：
  * - 从用户脚本提取 TaskEngine 及依赖，替换延迟为 0 后真实执行 _runRoom。
  * - 覆盖：基础领养、摸自己 0 成长重试/已满判定、完整流水线、指定 UID 预核对、排行榜前 N、
- *   登录失效终止、喂食零成长停止、手幅失败不标记完成。
+ *   登录失效终止、喂食零成长停止、手幅失败不标记完成、手幅成功后自动补喂回馈猫粮。
  */
 const assert = require('assert');
 const fs = require('fs');
@@ -202,14 +202,14 @@ async function run(store, api) {
       sendBanner: async () => { bannerCalls++; return { code: 0 }; },
     };
     const { ui, engine } = await run(store, api);
-    assert.strictEqual(feedCalls, 3, '余粮 2/1/0 应喂 3 次');
+    assert.strictEqual(feedCalls, 4, '余粮 2/1/0 应喂 3 次，手幅回馈后再自动补喂 1 次');
     assert.ok(selfPetCalls >= 12 && selfPetCalls <= 15, '摸自己应攒满 50（成长+4/次）');
     assert.strictEqual(rankPetCalls, 2, '摸同担 1 只猫 × 2 次');
     assert.strictEqual(bannerCalls, 1, '手幅应投 1 次');
     ['sign', 'feed', 'petSelf', 'petRank', 'banner'].forEach((s) => {
       assert.ok(store.marks.has(s), `应标记阶段 ${s}`);
     });
-    assert.strictEqual(store.stats.food, 3);
+    assert.strictEqual(store.stats.food, 4);
     assert.strictEqual(store.stats.gifts, 1);
     assert.ok(!engine._fatal, '不应有致命错误');
   }
@@ -279,18 +279,67 @@ async function run(store, api) {
     assert.ok(store.marks.has('feed'), '应标记喂食完成');
   }
 
-  /* 场景8：手幅失败 → 不标记完成、不计礼物 */
+  /* 场景8：手幅失败 → 不标记完成、不计礼物、不自动喂食 */
   {
-    const store = makeStore({ group: { banner: true } });
+    let feedCalls = 0;
+    const store = makeStore({
+      group: { banner: true, feed: true },
+      store: { stageDone: (r, s) => s === 'feed' },
+    });
     const api = {
       adopt: async () => ({ code: 0 }),
       masterRoomId: async () => 777,
       sendBanner: async () => ({ code: 1, message: '电池不足' }),
+      feed: async () => { feedCalls++; return { code: 0, data: { food_balance: 0 } }; },
     };
     const { ui } = await run(store, api);
     assert.ok(!store.marks.has('banner'), '手幅失败不应标记完成');
     assert.strictEqual(store.stats.gifts, 0);
+    assert.strictEqual(feedCalls, 0, '手幅失败不应自动喂食');
     assert.ok(ui.logs.some((l) => l.includes('电池不足')), '应提示失败原因');
+  }
+
+  /* 场景8b：手幅成功后即使喂食已完成，也自动补喂消耗回馈猫粮 */
+  {
+    let feedCalls = 0;
+    let bannerCalls = 0;
+    const store = makeStore({
+      group: { feed: true, banner: true },
+      store: { stageDone: (r, s) => s === 'feed' },
+    });
+    const api = {
+      adopt: async () => ({ code: 0 }),
+      masterRoomId: async () => 777,
+      sendBanner: async () => { bannerCalls++; return { code: 0 }; },
+      feed: async () => {
+        feedCalls++;
+        return { code: 0, data: { growth_delta: 5, food_balance: 0 } };
+      },
+    };
+    const { ui } = await run(store, api);
+    assert.strictEqual(bannerCalls, 1, '手幅应投 1 次');
+    assert.strictEqual(feedCalls, 1, '喂食已完成时，手幅回馈的 1 猫粮应补喂 1 次');
+    assert.ok(store.marks.has('banner'), '应标记手幅完成');
+    assert.strictEqual(store.stats.food, 1, '补喂应计入猫粮消耗统计');
+    assert.strictEqual(store.stats.growth, 5, '补喂应计入成长统计');
+    assert.ok(ui.logs.some((l) => l.includes('回馈猫粮')), '应提示手幅回馈猫粮');
+  }
+
+  /* 场景8c：手幅成功但未勾选喂食 → 不自动喂食 */
+  {
+    let feedCalls = 0;
+    const store = makeStore({ group: { banner: true } });
+    const api = {
+      adopt: async () => ({ code: 0 }),
+      masterRoomId: async () => 777,
+      sendBanner: async () => ({ code: 0 }),
+      feed: async () => { feedCalls++; return { code: 0, data: { food_balance: 0 } }; },
+    };
+    const { ui } = await run(store, api);
+    assert.strictEqual(feedCalls, 0, '未勾选喂食不应自动喂');
+    assert.ok(store.marks.has('banner'), '手幅成功应标记完成');
+    assert.strictEqual(store.stats.gifts, 1, '应计入礼物统计');
+    assert.ok(ui.logs.some((l) => l.includes('已投喂')), '应输出投喂成功日志');
   }
 
   /* 场景9：摸自己首轮被限流 → 自动补做一轮（只补摸自己），直到攒满 50 */
@@ -355,7 +404,8 @@ async function run(store, api) {
     assert.strictEqual(ui.logs.filter((l) => l.includes('补做')).length, 1, '最多只补做一次');
   }
 
-  console.log('✅ 引擎测试全部通过（12 个场景）');
+  const total = (fs.readFileSync(__filename, 'utf8').match(/\/\* 场景/g) || []).length;
+  console.log(`✅ 引擎测试全部通过（${total} 个场景）`);
 })().catch((e) => {
   console.error('引擎测试失败：', e);
   process.exit(1);

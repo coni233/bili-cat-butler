@@ -26,8 +26,8 @@ if (!chrome) {
 }
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'bili-cat-butler.user.js'), 'utf8');
-const panelHtml = src.match(/const PANEL_HTML = `([\s\S]*?)`;\n/)[1];
-const css = src.match(/const CSS = `([\s\S]*?)`;\n/)[1];
+const panelHtml = src.match(/const PANEL_HTML = `([\s\S]*?)`;\r?\n/)[1];
+const css = src.match(/const CSS = `([\s\S]*?)`;\r?\n/)[1];
 const fixture = fs.readFileSync(path.join(__dirname, 'fixtures', 'tbili-bare.css'), 'utf8');
 
 const switches = [
