@@ -164,6 +164,18 @@ assert.strictEqual(store.groupFor('22222').id, groupB.id);
 assert.strictEqual(store.groupFor('11111').id, 'default');
 assert.strictEqual(store.enabledStages('22222').includes('banner'), true);
 assert.strictEqual(store.enabledStages('11111').includes('banner'), false);
+
+/* 手动确认已完成：把房间所有已启用阶段标记为完成 */
+const storeC = new Store();
+storeC.groups = [storeC._defaultGroup()];
+storeC.groups[0].banner = true;
+assert.strictEqual(storeC.enabledStages('33333').length, 4);
+assert.strictEqual(storeC.roomDone('33333'), false);
+storeC.markRoomDone('33333');
+assert.strictEqual(storeC.roomDone('33333'), true);
+['sign', 'feed', 'petSelf', 'banner'].forEach((st) => {
+  assert.strictEqual(storeC.stageDone('33333', st), true, `应标记阶段 ${st}`);
+});
 store.resetAllToDefault();
 assert.strictEqual(store.groupFor('22222').id, 'default');
 assert.strictEqual(store.removeGroup('default'), false, '默认组不可删除');

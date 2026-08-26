@@ -93,6 +93,7 @@ function makeStore(overrides) {
     groupFor: () => group,
     stageDone: () => false,
     markStage: (ruid, stage) => { marks.add(stage); },
+    markRoomDone: (ruid) => { store.enabledStages(ruid).forEach((s) => marks.add(s)); },
     roomDone: () => false,
     enabledStages: () => [],
     selectedRooms: () => [],
@@ -350,7 +351,7 @@ async function run(store, api) {
       group: { petSelf: true, selfPetLimit: 15 },
       store: {
         roomDone: () => store.marks.has('petSelf'),
-        selectedRooms: () => [],
+        selectedRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
         pendingRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
       },
     });
@@ -383,7 +384,7 @@ async function run(store, api) {
       group: { petSelf: true, selfPetLimit: 15 },
       store: {
         roomDone: () => store.marks.has('petSelf'),
-        selectedRooms: () => [],
+        selectedRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
         pendingRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
       },
     });
@@ -402,6 +403,22 @@ async function run(store, api) {
     assert.strictEqual(petCalls, 12, '首轮 6 次 + 补做轮 6 次，最多两轮即停');
     assert.ok(!store.marks.has('petSelf'), '始终 0 成长不应标记完成');
     assert.strictEqual(ui.logs.filter((l) => l.includes('补做')).length, 1, '最多只补做一次');
+    assert.ok(ui.logs.some((l) => l.includes('不会自动重试')), '单次模式应提示不会自动重试');
+    assert.ok(ui.logs.some((l) => l.includes('今日已满或暂不可摸')), '未完成提示应说明可能原因');
+  }
+
+  /* 场景11：手动确认完成 → 标记未完成阶段并更新房间状态 */
+  {
+    const store = makeStore({
+      group: { petSelf: true },
+      store: { enabledStages: () => ['petSelf'] },
+    });
+    const ui = makeUi();
+    const engine = new TaskEngine({ store, api: {}, session, ui });
+    engine._roomStates.set('11111', 'failed');
+    engine.confirmRoomDone('11111');
+    assert.ok(store.marks.has('petSelf'), '应标记摸自己完成');
+    assert.strictEqual(engine.roomState('11111'), 'done', '房间状态应更新为已完成');
   }
 
   const total = (fs.readFileSync(__filename, 'utf8').match(/\/\* 场景/g) || []).length;

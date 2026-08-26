@@ -4,7 +4,7 @@
 // @homepageURL  https://github.com/coni233/bili-cat-butler
 // @supportURL   https://github.com/coni233/bili-cat-butler/issues
 // @license      MIT
-// @version      1.0.2
+// @version      1.0.3
 // @description  开源的 B 站直播养猫自动化工具：签到 / 喂食 / 摸自己 / 摸同担（全部/前N/指定UID）/ 投喂手幅。全新界面与任务引擎，零自动关注、纯本地存储、可审计。
 // @author       coni
 // @match        https://live.bilibili.com/*
@@ -37,7 +37,7 @@
   'use strict';
 
   /* 脚本版本：优先读取管理器提供的版本号，测试环境回退到内置值 */
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.0.2';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.0.3';
 
   /* ===================== 事实常量（B 站活动接口参数） ===================== */
   const ACTIVITY = Object.freeze({
@@ -384,6 +384,11 @@
       GM_setValue(STORAGE_KEYS.daily, this.daily);
     }
 
+    /* 手动确认：把房间所有已启用阶段标记为完成（供用户在人工核对后使用） */
+    markRoomDone(ruid) {
+      this.enabledStages(ruid).forEach((st) => this.markStage(ruid, st));
+    }
+
     enabledStages(ruid) {
       const g = this.groupFor(ruid);
       return STAGES.filter((k) => g[k]);
@@ -714,6 +719,12 @@
       return this.store.roomDone(key) ? 'done' : 'idle';
     }
 
+    /* 手动确认该房间今日完成：标记未完成阶段并同步状态 */
+    confirmRoomDone(ruid) {
+      this.store.markRoomDone(ruid);
+      this._roomStates.set(String(ruid), 'done');
+    }
+
     async start(options) {
       const opt = options || {};
       const testMode = !!opt.testMode;
@@ -763,8 +774,14 @@
         } else {
           const unfinished = this.store.selectedRooms().filter((r) => !this.store.roomDone(r.ruid));
           if (unfinished.length) {
-            this.ui.log('warn', `仍有 ${unfinished.length} 个房间有未完成项（多为摸猫被限流或临时失败），巡航/下次运行会自动重试。`);
-            if (this.store.settings.notify) gmNotify('猫咪养成助手', `${unfinished.length} 个房间未完成，稍后会自动重试。`);
+            const n = unfinished.length;
+            if (this.store.settings.mode === 'cruise') {
+              this.ui.log('warn', `仍有 ${n} 个房间未完成（可能今日已满或暂不可摸），将在下一轮巡航时自动重试。`);
+              if (this.store.settings.notify) gmNotify('猫咪养成助手', `${n} 个房间未完成（可能今日已满或暂不可摸），将在下一轮巡航时自动重试。`);
+            } else {
+              this.ui.log('warn', `仍有 ${n} 个房间未完成（可能今日已满或暂不可摸）。单次模式不会自动重试：可查看任务列表、手动进入直播间确认猫的状态，或直接再次点击「开始」补跑。`);
+              if (this.store.settings.notify) gmNotify('猫咪养成助手', `${n} 个房间未完成（可能今日已满或暂不可摸），请查看任务列表，手动进入直播间确认。`);
+            }
           } else {
             this.ui.log('ok', '🎉 本轮任务全部结束。');
             if (this.store.settings.notify) gmNotify('猫咪养成助手', '本轮养猫任务完成喵～');
@@ -1669,6 +1686,7 @@
       display: block;
     }
     #mc-root .mc-room-uid { font-size: 10px; color: var(--mc-sub); }
+    #mc-root .mc-room .mc-confirm-done { flex-shrink: 0; padding: 3px 9px; font-size: 11px; }
     #mc-root .mc-state {
       font-size: 11px;
       padding: 2px 8px;
@@ -2138,6 +2156,18 @@
       bind(els.stop, 'click', () => this.engine.stop(), 'stop');
 
       bind(els.clearToday, 'click', () => this.engine.resetToday(), 'clearToday');
+      bind(els.roomList, 'click', (e) => {
+        const btn = e.target.closest('[data-confirm-done]');
+        if (!btn || !this.engine) return;
+        const ruid = btn.dataset.confirmDone;
+        const room = this.store.selectedRooms().find((r) => r.ruid === ruid);
+        if (!room) return;
+        if (!window.confirm(`手动确认「${room.name}」今日任务已完成？未完成的阶段将被标记为已完成，之后不再自动重试。`)) return;
+        this.engine.confirmRoomDone(ruid);
+        this.log('ok', `已手动确认「${room.name}」完成。`);
+        this.renderJobs();
+        this.sync();
+      }, 'roomListConfirm');
       bind(els.logClear, 'click', () => { els.logBox.innerHTML = ''; }, 'logClear');
       bind(els.logExport, 'click', () => this.exportLog(), 'logExport');
 
@@ -2446,11 +2476,16 @@
       this.el.blacklist.value = s.blacklist;
 
       const rooms = this.store.selectedRooms();
+      const running = !!(this.engine && this.engine.running);
+      const paused = !!(this.engine && this.engine.paused);
       this.el.roomList.innerHTML = rooms.map((r) => {
         const state = this.engine ? this.engine.roomState(r.ruid) : 'idle';
         const grp = this.store.groupFor(r.ruid);
         const stages = this.store.enabledStages(r.ruid).filter((k) => this.store.stageDone(r.ruid, k)).length;
         const total = Math.max(1, this.store.enabledStages(r.ruid).length);
+        const confirmBtn = state === 'failed' && !running
+          ? `<button class="mc-btn mc-confirm-done" data-confirm-done="${escapeHtml(r.ruid)}" title="手动确认该房间今日已完成，未完成阶段将标记为已完成">确认完成</button>`
+          : '';
         return `<div class="mc-room">
           <span class="mc-room-main">
             <span class="mc-room-name">${escapeHtml(r.name)}<span class="mc-tag mc-group-tag">${escapeHtml(grp.name)}</span></span>
@@ -2458,18 +2493,17 @@
           </span>
           <span class="mc-state ${state}">${STATE_LABELS[state] || state}</span>
           <span class="mc-room-stages">${stages}/${total}</span>
+          ${confirmBtn}
         </div>`;
       }).join('') || '<div class="mc-empty">尚未选择房间，去「猫咪」页挑选</div>';
 
       const done = rooms.filter((r) => this.store.roomDone(r.ruid)).length;
-      const total = rooms.length || 1;
-      this.el.ringPct.textContent = `${Math.round((done / total) * 100)}%`;
+      const totalRooms = rooms.length || 1;
+      this.el.ringPct.textContent = `${Math.round((done / totalRooms) * 100)}%`;
       this.el.ringSub.textContent = `${done} / ${rooms.length}`;
       this.el.ringFg.style.strokeDasharray = String(RING_CIRC);
-      this.el.ringFg.style.strokeDashoffset = String(RING_CIRC * (1 - done / total));
+      this.el.ringFg.style.strokeDashoffset = String(RING_CIRC * (1 - done / totalRooms));
 
-      const running = !!(this.engine && this.engine.running);
-      const paused = !!(this.engine && this.engine.paused);
       this.el.start.disabled = running;
       this.el.pause.disabled = !running;
       this.el.stop.disabled = !running;
