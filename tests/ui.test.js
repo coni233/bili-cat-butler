@@ -12,14 +12,14 @@ const { JSDOM } = require('jsdom');
 const src = fs.readFileSync(path.join(__dirname, '..', 'bili-cat-butler.user.js'), 'utf8');
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function boot() {
+function boot(seed) {
   const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
     url: 'https://live.bilibili.com/21013446?live_from=82002',
     runScripts: 'outside-only',
     pretendToBeVisual: true,
   });
   const { window } = dom;
-  const storage = {};
+  const storage = Object.assign({}, seed || {});
   window.GM_addStyle = () => {};
   window.GM_getValue = (key, fallback) => (Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : fallback);
   window.GM_setValue = (key, value) => { storage[key] = value; };
@@ -62,6 +62,7 @@ function boot() {
 
   /* 1. 面板与登录态 */
   assert.ok(doc.getElementById('mc-root'), '面板应存在');
+  assert.ok(doc.querySelector('.mc-brand-sub').textContent.includes('v1.0.4'), '标题应显示版本号');
   assert.ok(doc.getElementById('mc-login-text').textContent.includes('已登录'), '登录栏应显示已登录');
   assert.ok(doc.getElementById('mc-cat-list').textContent.includes('张三'), '自动拉取后列表应有张三');
 
@@ -113,6 +114,25 @@ function boot() {
 
   /* 8. 无初始化/运行错误 */
   assert.ok(!issues.some((l) => l.includes('初始化失败')), '不应有初始化失败：' + issues.join(' | '));
+
+  /* 9. 忽略已完成：勾选后只显示未完成房间 */
+  {
+    const d = new Date();
+    const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const seeded = boot({
+      'miao.daily.v1': { date, rooms: { '11111': { sign: true, feed: true, petSelf: true } } },
+    });
+    const doc2 = seeded.window.document;
+    await wait(1300);
+    doc2.getElementById('mc-select-page').click();
+    await wait(30);
+    assert.ok(doc2.getElementById('mc-hide-done'), '应有「忽略已完成」勾选框');
+    doc2.getElementById('mc-hide-done').click();
+    await wait(30);
+    const listText = doc2.getElementById('mc-room-list').textContent;
+    assert.ok(!listText.includes('张三'), '应隐藏已完成房间（张三）');
+    assert.ok(listText.includes('李四'), '应显示未完成房间（李四）');
+  }
 
   console.log('✅ UI 测试全部通过');
 })().catch((e) => {

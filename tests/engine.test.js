@@ -94,6 +94,9 @@ function makeStore(overrides) {
     stageDone: () => false,
     markStage: (ruid, stage) => { marks.add(stage); },
     markRoomDone: (ruid) => { store.enabledStages(ruid).forEach((s) => marks.add(s)); },
+    _petGrowth: 0,
+    petSelfGrowth: () => store._petGrowth || 0,
+    setPetSelfGrowth: (ruid, gained) => { store._petGrowth = gained; },
     roomDone: () => false,
     enabledStages: () => [],
     selectedRooms: () => [],
@@ -419,6 +422,40 @@ async function run(store, api) {
     engine.confirmRoomDone('11111');
     assert.ok(store.marks.has('petSelf'), '应标记摸自己完成');
     assert.strictEqual(engine.roomState('11111'), 'done', '房间状态应更新为已完成');
+  }
+
+  /* 场景12：首轮摸到部分成长后被限流 → 补做轮从累计值继续，攒满 50 即完成 */
+  {
+    let petCalls = 0;
+    const store = makeStore({
+      group: { petSelf: true, selfPetLimit: 15 },
+      store: {
+        roomDone: () => store.marks.has('petSelf'),
+        selectedRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
+        pendingRooms: () => (store.marks.has('petSelf') ? [] : [{ ruid: '11111', name: '测试房间' }]),
+      },
+    });
+    const api = {
+      adopt: async () => ({ code: 0 }),
+      pet: async () => {
+        petCalls++;
+        if (petCalls <= 3) return { code: 0, data: { growth_delta: 10 } };
+        if (petCalls <= 9) return { code: 0, data: { growth_delta: 0 } };
+        return { code: 0, data: { growth_delta: 10 } };
+      },
+    };
+    const ui = makeUi();
+    const engine = new TaskEngine({
+      store,
+      api,
+      session: { uid: '10086', csrf: 'csrf', refresh: async () => ({ uid: '10086', name: '测试用户' }) },
+      ui,
+    });
+    await engine.start({ testMode: false });
+    assert.strictEqual(petCalls, 11, '3 次成功 + 6 次 0 成长退避 + 补做轮 2 次成功（累计 50 即停）');
+    assert.ok(store.marks.has('petSelf'), '补做轮累计到 50 后应标记完成');
+    assert.ok(ui.logs.some((l) => l.includes('累计 50/50')), '日志应显示累计 50 成长');
+    assert.ok(ui.logs.some((l) => l.includes('今日已累计 30/50')), '补做轮开始应提示已累计 30');
   }
 
   const total = (fs.readFileSync(__filename, 'utf8').match(/\/\* 场景/g) || []).length;

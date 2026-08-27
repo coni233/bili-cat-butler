@@ -4,7 +4,7 @@
 // @homepageURL  https://github.com/coni233/bili-cat-butler
 // @supportURL   https://github.com/coni233/bili-cat-butler/issues
 // @license      MIT
-// @version      1.0.3
+// @version      1.0.4
 // @description  开源的 B 站直播养猫自动化工具：签到 / 喂食 / 摸自己 / 摸同担（全部/前N/指定UID）/ 投喂手幅。全新界面与任务引擎，零自动关注、纯本地存储、可审计。
 // @author       coni
 // @match        https://live.bilibili.com/*
@@ -37,7 +37,7 @@
   'use strict';
 
   /* 脚本版本：优先读取管理器提供的版本号，测试环境回退到内置值 */
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.0.3';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.0.4';
 
   /* ===================== 事实常量（B 站活动接口参数） ===================== */
   const ACTIVITY = Object.freeze({
@@ -95,6 +95,7 @@
     pokeTimes: 3,         // 每只他人猫咪抚摸次数
     banner: false,
     blacklist: '',
+    hideDone: false,      // 任务页「忽略已完成」勾选状态
     notify: true,
   });
 
@@ -387,6 +388,19 @@
     /* 手动确认：把房间所有已启用阶段标记为完成（供用户在人工核对后使用） */
     markRoomDone(ruid) {
       this.enabledStages(ruid).forEach((st) => this.markStage(ruid, st));
+    }
+
+    /* 摸自己今日已累计的成长值（跨轮次/跨运行继承，清空进度时清零） */
+    petSelfGrowth(ruid) {
+      const rec = this.daily.rooms[String(ruid)];
+      return rec && rec.petSelfGrowth ? (Number(rec.petSelfGrowth) || 0) : 0;
+    }
+
+    setPetSelfGrowth(ruid, gained) {
+      const key = String(ruid);
+      if (!this.daily.rooms[key]) this.daily.rooms[key] = {};
+      this.daily.rooms[key].petSelfGrowth = Number(gained) || 0;
+      GM_setValue(STORAGE_KEYS.daily, this.daily);
     }
 
     enabledStages(ruid) {
@@ -988,8 +1002,8 @@
       /* 3) 摸自己的猫：攒满 50 成长 */
       let petSelfIncomplete = false;
       if (g.petSelf && (force || !store.stageDone(ruid, 'petSelf'))) {
-        this.ui.log('info', `[摸自己] ${room.name}：开始…`);
-        let gained = 0;
+        let gained = store.petSelfGrowth(ruid);
+        this.ui.log('info', `[摸自己] ${room.name}：开始…${gained ? `（今日已累计 ${gained}/50）` : ''}`);
         let rounds = 0;
         let zeroStreak = 0;
         let reason = 'limit';
@@ -1027,8 +1041,9 @@
             }
             zeroStreak = 0;
             gained += delta;
+            store.setPetSelfGrowth(ruid, gained);
             store.bumpStats({ pets: (store.stats.pets || 0) + 1, growth: (store.stats.growth || 0) + delta });
-            this.ui.log('ok', `[摸自己] 第 ${rounds} 次：成长 +${delta}（本轮 ${gained}/50）`);
+            this.ui.log('ok', `[摸自己] 第 ${rounds} 次：成长 +${delta}（累计 ${gained}/50）`);
             (d.level_up_list || []).forEach((l) => this.ui.log('star', `🎉 ${l.title || '恭喜升级！'}`));
             if (gained >= 50) {
               reason = 'cap';
@@ -1667,6 +1682,7 @@
     #mc-root .mc-ring-text b { font-size: 20px; color: var(--mc-accent); }
     #mc-root .mc-ring-text span { font-size: 11px; color: var(--mc-sub); }
     #mc-root .mc-room-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+    #mc-root .mc-hide-done { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--mc-sub); cursor: pointer; }
     #mc-root .mc-room {
       display: flex;
       align-items: center;
@@ -1795,7 +1811,7 @@
   const PANEL_HTML = `
   <div id="mc-root">
     <div class="mc-header" id="mc-header">
-      <div class="mc-brand">🐈 猫咪养成助手 <span class="mc-brand-sub">Bili Cat Butler</span></div>
+      <div class="mc-brand">🐈 猫咪养成助手 <span class="mc-brand-sub" id="mc-brand-sub">Bili Cat Butler</span></div>
       <button class="mc-icon-btn" id="mc-collapse" title="折叠">—</button>
     </div>
     <div class="mc-login-bar" id="mc-login-bar"><span class="dot"></span><span id="mc-login-text">登录检测中…</span></div>
@@ -1872,6 +1888,7 @@
         <div class="mc-room-list" id="mc-room-list"></div>
         <div class="mc-foot-row">
           <button class="mc-btn" id="mc-clear-today">🗑 清空今日进度</button>
+          <label class="mc-hide-done"><input type="checkbox" id="mc-hide-done" /> 忽略已完成</label>
         </div>
       </section>
       <section class="mc-page" id="mc-page-logs" hidden>
@@ -1932,14 +1949,14 @@
       host.innerHTML = PANEL_HTML;
 
       const ids = [
-        'root', 'header', 'collapse', 'fab', 'file-import',
+        'root', 'header', 'brand-sub', 'collapse', 'fab', 'file-import',
         'login-bar', 'login-text', 'fetch', 'meta', 'search',
         'cat-list', 'selected-count',
         'select-page', 'clear-sel', 'reset-group', 'export-sel', 'import-sel',
         'opt-row', 'rank-panel', 'rank-topn', 'rank-uids', 'rank-uid-meta', 'poke-times', 'mode-row', 'cruise-min', 'blacklist',
         'group-chips', 'group-add', 'group-rename', 'group-del', 'group-filter', 'assign-group', 'assign-btn',
         'start', 'pause', 'stop', 'ring-fg', 'ring-pct', 'ring-sub',
-        'room-list', 'clear-today', 'log-clear', 'log-export', 'log', 'stats',
+        'room-list', 'hide-done', 'clear-today', 'log-clear', 'log-export', 'log', 'stats',
       ];
       const toKey = (id) => {
         if (id === 'log') return 'logBox';
@@ -1953,6 +1970,7 @@
       if (missingIds.length) {
         console.warn('[猫咪养成助手] 面板元素缺失：', missingIds.map((x) => `mc-${x}`).join(', '));
       }
+      if (this.el.brandSub) this.el.brandSub.textContent = `Bili Cat Butler v${SCRIPT_VERSION}`;
       this.el.tabs = Array.from(host.querySelectorAll('.mc-tab'));
       this.el.pages = Array.from(host.querySelectorAll('.mc-page'));
       this.el.chips = Array.from(host.querySelectorAll('.mc-chip'));
@@ -2156,6 +2174,11 @@
       bind(els.stop, 'click', () => this.engine.stop(), 'stop');
 
       bind(els.clearToday, 'click', () => this.engine.resetToday(), 'clearToday');
+      bind(els.hideDone, 'change', () => {
+        this.store.settings.hideDone = !!els.hideDone.checked;
+        this.store.saveSettings();
+        this.renderJobs();
+      }, 'hideDone');
       bind(els.roomList, 'click', (e) => {
         const btn = e.target.closest('[data-confirm-done]');
         if (!btn || !this.engine) return;
@@ -2478,7 +2501,10 @@
       const rooms = this.store.selectedRooms();
       const running = !!(this.engine && this.engine.running);
       const paused = !!(this.engine && this.engine.paused);
-      this.el.roomList.innerHTML = rooms.map((r) => {
+      const hideDone = !!this.store.settings.hideDone;
+      this.el.hideDone.checked = hideDone;
+      const visible = hideDone ? rooms.filter((r) => !this.store.roomDone(r.ruid)) : rooms;
+      this.el.roomList.innerHTML = visible.map((r) => {
         const state = this.engine ? this.engine.roomState(r.ruid) : 'idle';
         const grp = this.store.groupFor(r.ruid);
         const stages = this.store.enabledStages(r.ruid).filter((k) => this.store.stageDone(r.ruid, k)).length;
@@ -2495,7 +2521,9 @@
           <span class="mc-room-stages">${stages}/${total}</span>
           ${confirmBtn}
         </div>`;
-      }).join('') || '<div class="mc-empty">尚未选择房间，去「猫咪」页挑选</div>';
+      }).join('') || (rooms.length
+        ? '<div class="mc-empty">全部房间均已完成 ✓</div>'
+        : '<div class="mc-empty">尚未选择房间，去「猫咪」页挑选</div>');
 
       const done = rooms.filter((r) => this.store.roomDone(r.ruid)).length;
       const totalRooms = rooms.length || 1;

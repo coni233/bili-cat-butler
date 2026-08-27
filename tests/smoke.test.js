@@ -176,6 +176,12 @@ assert.strictEqual(storeC.roomDone('33333'), true);
 ['sign', 'feed', 'petSelf', 'banner'].forEach((st) => {
   assert.strictEqual(storeC.stageDone('33333', st), true, `应标记阶段 ${st}`);
 });
+
+/* 摸自己累计成长：跨轮次/跨运行继承 */
+const storeD = new Store();
+assert.strictEqual(storeD.petSelfGrowth('44444'), 0);
+storeD.setPetSelfGrowth('44444', 30);
+assert.strictEqual(storeD.petSelfGrowth('44444'), 30);
 store.resetAllToDefault();
 assert.strictEqual(store.groupFor('22222').id, 'default');
 assert.strictEqual(store.removeGroup('default'), false, '默认组不可删除');
