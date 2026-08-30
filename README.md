@@ -16,10 +16,17 @@
 
 ## 📦 安装
 
+**推荐：从 Greasy Fork 一键安装（自动更新）**
+
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（Edge/Chrome 扩展商店均可搜索安装）
-2. 打开 Tampermonkey 管理面板 → 「添加新脚本」
-3. 删除编辑器默认内容，把 [`bili-cat-butler.user.js`](./bili-cat-butler.user.js) 全部内容粘贴进去，按 `Ctrl+S` 保存
-4. 登录 B 站，打开直播页（`live.bilibili.com`）或动态页（`t.bilibili.com`），左侧会出现「🐈 猫咪养成助手」面板
+2. 打开 [Greasy Fork 脚本页](https://greasyfork.org/zh-CN/scripts/592922-猫咪养成助手)，点击「安装此脚本」并确认
+3. 登录 B 站，打开直播页（`live.bilibili.com`）或动态页（`t.bilibili.com`），左侧会出现「🐈 猫咪养成助手」面板
+
+**手动安装（开发者 / 离线方式）**
+
+1. 打开 Tampermonkey 管理面板 → 「添加新脚本」
+2. 删除编辑器默认内容，把 [`bili-cat-butler.user.js`](./bili-cat-butler.user.js) 全部内容粘贴进去，按 `Ctrl+S` 保存
+3. 登录 B 站，打开直播页（`live.bilibili.com`）或动态页（`t.bilibili.com`），左侧会出现「🐈 猫咪养成助手」面板
 
 > 也可以把脚本文件放入 Tampermonkey 的「实用工具 → 文件」导入。
 
